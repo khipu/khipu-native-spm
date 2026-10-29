@@ -53,7 +53,7 @@ public final class KhipuPayment {
         // This init is wiring only. It is not unit-tested beyond the origin mapping (KhipuTestingTests): the
         // behaviour behind each seam is unit-tested in the coordinator and host suites, and the quickstart sample's
         // UI tests drive the public wiring end to end.
-        let dispatcher = BridgeDispatcher()
+        let dispatcher = BridgeDispatcher(telemetry: telemetry)
         // getCapabilities_v1 reports the live registry as generated Capability values.
         dispatcher.register(
             GetCapabilitiesCapability(registry: { [weak dispatcher] in
@@ -68,12 +68,11 @@ public final class KhipuPayment {
         // (default ON; Package.swift). When the flag is OFF the entire detector source compiles to nothing, so
         // bridge.capability_disabled is emitted EXACTLY ONCE here, from always-present code (CapabilityDiagnostics),
         // because the gated component cannot emit its own. The bank-return seam stays a `(String) -> Void` so no
-        // detector type leaks past the #if. Both emit to the no-op sink, not the injected `telemetry` (there is no
-        // integrator telemetry API); their emit-once and signal behaviour are unit-tested directly with recording
-        // sinks.
+        // detector type leaks past the #if. Both emit to the injected sink, which the public init sets to
+        // NoopTelemetrySink; their emit-once and signal behaviour are unit-tested directly with recording sinks.
         let bankReturnOnForeground: (String) -> Void
         #if KHIPU_CAP_BANK_RETURN
-        let bankReturnDetector = BankReturnDetector(telemetry: NoopTelemetrySink())
+        let bankReturnDetector = BankReturnDetector(telemetry: telemetry)
         // onLaunched records the bank-app launch marker so the next foreground resume is recognizable.
         dispatcher.register(AppLauncher(onLaunched: { bankReturnDetector.recordLaunch() }))
         bankReturnOnForeground = { hash in bankReturnDetector.onForegroundReturn(operationIdHash: hash) }
@@ -81,7 +80,7 @@ public final class KhipuPayment {
         dispatcher.register(AppLauncher())
         bankReturnOnForeground = { _ in }
         CapabilityDiagnostics.emitCapabilityDisabled(
-            NoopTelemetrySink(),
+            telemetry,
             capabilityId: CapabilityDiagnostics.capBankReturnDetector,
             osVersion: ProcessInfo.processInfo.operatingSystemVersion.majorVersion
         )
@@ -415,7 +414,7 @@ extension KhipuPaymentInternal {
             // restart; records expire after 30 days. A plain file in a directory excluded from backup, Foundation
             // only (NoBackupFileOrphanStore explains why not UserDefaults, and why not the Keychain, which would
             // leak operationIds across installs). Mirrors the Android wiring.
-            orphanStore: OrphanMetadataStore(store: NoBackupFileOrphanStore()),
+            orphanStore: OrphanMetadataStore(store: NoBackupFileOrphanStore(), telemetry: telemetry),
             // Forward the build-flag-gated bank-return seam to the designated init.
             onBankAppReturn: onBankAppReturn
         )

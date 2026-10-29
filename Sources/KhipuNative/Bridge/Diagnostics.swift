@@ -14,7 +14,7 @@ enum Diagnostics {
     // contract_version is the envelope version in v1, resolved from the GENERATED ContractConstants.envelopeVersion
     // (one source, no hand-mirror to drift); bridge/codegen/src/governance-gate.ts cross-checks
     // CONTRACT_VERSION.ts == contract-version.json golden == ContractConstants.kt == .swift.
-    static let sdkVersion = "1.0.1"
+    static let sdkVersion = "1.0.2"
     static let contractVersion = ContractConstants.envelopeVersion
 
     static func build(
