@@ -14,14 +14,16 @@ enum JsTarget {
 
 /// The injectable JS-delivery seam. A `BridgeResponder` calls this to push a terminal response envelope into the
 /// page's `window.khipuBridge._respond(...)`, or an outbound native→web request envelope into
-/// `window.khipuBridge._request(...)` (`JsTarget` selects the landing point). The real default (`KhipuWebViewHost`)
-/// wraps `WKWebView.callAsyncJavaScript`; unit tests inject a fake so the readiness/liveness/teardown/delivery-error
-/// paths are testable WITHOUT a real WKWebView.
+/// `window.khipuBridge._request(...)` (`JsTarget` selects the landing point). `documentToken` is the token of the
+/// delivery's epoch: the script runs only in the document the readiness probe marked with it (see `BridgeScripts`).
+/// The real default (`KhipuWebViewHost`) wraps `WKWebView.callAsyncJavaScript`; unit tests inject a fake so the
+/// readiness/liveness/teardown/delivery-error paths are testable WITHOUT a real WKWebView.
 ///
 /// `onResult` reports delivery success/failure: `(true, nil)` on success, `(false, reason)` on a JS execution
 /// failure. **Asymmetric mechanism, identical outcome:** iOS's `callAsyncJavaScript` `Result.failure` IS a real
 /// error channel (Android must synthesize one via a JS sentinel). Both feed the SAME `onResult` contract.
-typealias JsDelivery = (_ envelopeJSON: String, _ target: JsTarget, _ onResult: @escaping (Bool, String?) -> Void) -> Void
+typealias JsDelivery = (_ envelopeJSON: String, _ target: JsTarget, _ documentToken: String,
+                        _ onResult: @escaping (Bool, String?) -> Void) -> Void
 
 /// What a readiness probe that found `window.khipuBridge` led to: the epoch became ready and flushed (`ready`), it is
 /// still waiting for its own document's request for the bundle and the host should probe again (`pending`), or it
@@ -59,6 +61,10 @@ final class BridgeResponder {
     private var probeMisses = 0 // bounded readiness re-poll budget for the current epoch
     private var probeExhausted = false // re-poll budget spent without khipuBridge appearing: fail-closed with diagnostics
     private var hostLoadPending = false // a host-initiated load() bumped the epoch; its own commit must NOT re-bump
+    // The token generator, injected so tests are deterministic, and the current epoch's document token, rotated with
+    // the epoch and read and written only under `lock`.
+    private let newDocumentToken: () -> String
+    private var documentToken: String
     private let maxProbeAttempts: Int
     private struct Queued { let generation: Int; let responseJSON: String; let target: JsTarget }
     private var queue: [Queued] = []
@@ -79,16 +85,26 @@ final class BridgeResponder {
     static let defaultMaxProbeAttempts = 28
 
     init(deliver: @escaping JsDelivery, telemetry: TelemetrySink = NoopTelemetrySink(), maxQueued: Int = 64,
-         maxProbeAttempts: Int = BridgeResponder.defaultMaxProbeAttempts, onUnverifiedReady: @escaping () -> Void = {}) {
+         maxProbeAttempts: Int = BridgeResponder.defaultMaxProbeAttempts, onUnverifiedReady: @escaping () -> Void = {},
+         newDocumentToken: @escaping () -> String = BridgeScripts.newDocumentToken) {
         self.jsDeliver = deliver
         self.telemetry = telemetry
         self.maxQueued = maxQueued
         self.maxProbeAttempts = maxProbeAttempts
         self.onUnverifiedReady = onUnverifiedReady
+        self.newDocumentToken = newDocumentToken
+        self.documentToken = newDocumentToken()
     }
 
     /// Current page epoch — captured per request (in the WKScriptMessageHandler) so a delivery can never cross into a later page.
     func generation() -> Int { lock.lock(); defer { lock.unlock() }; return pageGeneration }
+
+    /// The document token for epoch `generation`, or nil when that epoch is no longer current: a probe for it has
+    /// nothing left to judge.
+    func documentToken(for generation: Int) -> String? {
+        lock.lock(); defer { lock.unlock() }
+        return generation == pageGeneration ? documentToken : nil
+    }
 
     /// New page epoch for a HOST-initiated load: bump the epoch, drop readiness, reset the probe budget, abandon any
     /// queued responses from the previous page WITH a per-item `stale_page` diagnostic (the same dropped delivery as
@@ -116,6 +132,7 @@ final class BridgeResponder {
     private func bumpEpoch(markHostLoad: Bool, requireVerifiedBundle: Bool?) {
         lock.lock()
         pageGeneration += 1
+        documentToken = newDocumentToken()
         ready = false
         probeMisses = 0
         probeExhausted = false
@@ -165,8 +182,9 @@ final class BridgeResponder {
             let gen = pageGeneration
             let flush = queue.filter { $0.generation == gen }
             queue.removeAll()
+            let token = documentToken
             lock.unlock()
-            for item in flush { evalDeliver(item.responseJSON, item.target) } // outside the lock: never eval while holding it
+            for item in flush { evalDeliver(item.responseJSON, item.target, token) } // outside the lock: never eval while holding it
             return .ready
         case .awaitingPageRequest:
             probeMisses += 1
@@ -271,18 +289,20 @@ final class BridgeResponder {
         } else if !ready {
             gateReason = "page_not_ready"
         }
+        let token = documentToken
         lock.unlock()
         if let reason = gateReason {
             onResult(false, reason)
             return
         }
-        jsDeliver(payload ?? "", target, onResult) // outside the lock: never eval while holding it
+        jsDeliver(payload ?? "", target, token, onResult) // outside the lock: never eval while holding it
     }
 
     private func submit(_ envelopeJSON: String, generation: Int, target: JsTarget) {
         var dropReason: String?
         var dropSeverity = "warn"
         var doEval = false
+        var token = ""
         var gateDrop = false
         var evictedJSON: String? = nil // a RESPOND pushed out to make room for the payment REQUEST
         lock.lock()
@@ -319,6 +339,7 @@ final class BridgeResponder {
             }
         } else {
             doEval = true
+            token = documentToken
         }
         lock.unlock()
         // Outside the lock (deferred-telemetry discipline): the evicted response is reported with the SAME reason it
@@ -326,14 +347,14 @@ final class BridgeResponder {
         if let evictedJSON { emitFailure(evictedJSON, "readiness_queue_overflow", "warn") }
         if gateDrop { return }
         if doEval {
-            evalDeliver(envelopeJSON, target)
+            evalDeliver(envelopeJSON, target, token)
         } else if let reason = dropReason {
             emitFailure(envelopeJSON, reason, dropSeverity)
         }
     }
 
-    private func evalDeliver(_ envelopeJSON: String, _ target: JsTarget) {
-        jsDeliver(envelopeJSON, target) { [weak self] ok, reason in
+    private func evalDeliver(_ envelopeJSON: String, _ target: JsTarget, _ documentToken: String) {
+        jsDeliver(envelopeJSON, target, documentToken) { [weak self] ok, reason in
             if !ok { self?.emitFailure(envelopeJSON, reason ?? "eval_failed", "error") } // a delivery error is reported, never swallowed
         }
     }

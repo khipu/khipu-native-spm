@@ -190,55 +190,21 @@ final class KhipuWebViewHost: NSObject, WKScriptMessageHandler, WKNavigationDele
         // iOS floor is 15 because this API's WebKit Swift overlay crashes on real iOS 14 devices, so no
         // `evaluateJavaScript` fallback is needed.
         self.responder = BridgeResponder(
-            deliver: { [weak webView] envelopeJSON, target, onResult in
+            deliver: { [weak webView] payload, target, token, onResult in
                 // Deliver on the main queue: the dispatcher already hops to main; assert it so the WebView is only
                 // ever touched on the main thread.
                 dispatchPrecondition(condition: .onQueue(.main))
                 guard let webView = webView else { onResult(false, "webview_unavailable"); return }
+                // The payload travels as a STRUCTURED argument; only the SDK-built script is code.
+                var arguments: [String: Any] = ["t": token]
                 switch target {
-                case .respond, .request:
-                    // REQUEST lands on `_request` (the façade's native→web inlet); `_respond` is the web→native
-                    // response delivery. The landing name is an SDK-controlled literal; the envelope still travels as
-                    // a STRUCTURED argument.
-                    let landing = target == .respond ? "_respond" : "_request"
-                    webView.callAsyncJavaScript(
-                        "window.khipuBridge.\(landing)(JSON.parse(r));",
-                        arguments: ["r": envelopeJSON],
-                        in: nil,
-                        in: .page
-                    ) { result in
-                        // Map ANY failure to the constant "eval_failed": the schema declares `reason` as an enum,
-                        // Android emits the same literal, and a raw localizedDescription would leak page-derived JS
-                        // error text into telemetry.
-                        if case .failure = result { onResult(false, "eval_failed") } else { onResult(true, nil) }
-                    }
-                case .resume:
-                    // The merchant operationId travels as a STRUCTURED argument (Android JSON-encodes it into its
-                    // eval sentinel instead).
-                    webView.callAsyncJavaScript(
-                        "window.khipuBridge._resume(id);",
-                        arguments: ["id": envelopeJSON],
-                        in: nil,
-                        in: .page
-                    ) { result in
-                        if case .failure = result { onResult(false, "eval_failed") } else { onResult(true, nil) }
-                    }
-                case .ping:
-                    // Only a strict `=== true` return IS the pong (Android checks the same predicate through its
-                    // 'ok'/'KHIPU_ERR:no_pong' sentinel); a throw resolves .failure and a non-true value is no pong,
-                    // and both report eval_failed.
-                    webView.callAsyncJavaScript(
-                        "return window.khipuBridge._ping() === true;",
-                        arguments: [:],
-                        in: nil,
-                        in: .page
-                    ) { result in
-                        if case .success(let value) = result, (value as? Bool) == true {
-                            onResult(true, nil)
-                        } else {
-                            onResult(false, "eval_failed")
-                        }
-                    }
+                case .respond, .request: arguments["r"] = payload
+                case .resume: arguments["id"] = payload
+                case .ping: break
+                }
+                webView.callAsyncJavaScript(BridgeScripts.delivery(target), arguments: arguments, in: nil, in: .page) { result in
+                    let (ok, reason) = KhipuWebViewHost.deliveryOutcome(target, result)
+                    onResult(ok, reason)
                 }
             },
             telemetry: telemetry,
@@ -646,7 +612,9 @@ final class KhipuWebViewHost: NSObject, WKScriptMessageHandler, WKNavigationDele
     /// there, the same probe reads the document's record of its bundle request, so both facts come from the same
     /// document.
     private func probeReadiness(generation: Int) {
-        webView.evaluateJavaScript("(typeof window.khipuBridge !== 'undefined')") { [weak self] result, _ in
+        // The token of the epoch this probe judges; a probe for an epoch that is no longer current judges nothing.
+        guard let token = responder.documentToken(for: generation) else { return }
+        webView.evaluateJavaScript(BridgeScripts.probe(token: token)) { [weak self] result, _ in
             guard let self = self else { return }
             guard Self.probeIndicatesReady(result) else {
                 if self.responder.onProbeMiss(generation: generation) { self.scheduleProbe(generation: generation) }
@@ -694,6 +662,17 @@ final class KhipuWebViewHost: NSObject, WKScriptMessageHandler, WKNavigationDele
     /// Pure parser for the readiness-probe result, extracted so unit tests can drive it without a real WKWebView.
     /// Mirrors Android's `JsResultParser`.
     static func probeIndicatesReady(_ result: Any?) -> Bool { (result as? Bool) == true }
+
+    /// A delivery's result: delivered, refused by a document the probe did not mark (reported as `stale_page`,
+    /// like any delivery whose page went stale), or failed. `_ping` counts only a strict `true` as delivered.
+    /// Mirrors Android's `JsResultParser.deliveryOutcome`. A raw error description never leaves: it could carry
+    /// page-derived text into telemetry.
+    static func deliveryOutcome(_ target: JsTarget, _ result: Result<Any, Error>) -> (Bool, String?) {
+        guard case .success(let value) = result else { return (false, "eval_failed") }
+        if (value as? String) == BridgeScripts.staleDocument { return (false, "stale_page") }
+        if target == .ping { return (value as? Bool) == true ? (true, nil) : (false, "eval_failed") }
+        return (true, nil)
+    }
 
     // MARK: The page-request seal
 

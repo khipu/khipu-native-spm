@@ -30,7 +30,7 @@ public final class KhipuPayment {
         self.init(origin: .production, telemetry: NoopTelemetrySink(), onHandshakeMs: nil)
     }
 
-    /// Test-only: creates an instance that loads the non-production origin named by `test` and wires its observation
+    /// Test-only: creates an instance that loads the origin named by `test` and wires its observation
     /// hooks. The origin is a fixed `KhipuTestOrigin`, never a URL. Available only through
     /// `@_spi(KhipuTesting) import KhipuNative`.
     @_spi(KhipuTesting) public convenience init(test: KhipuTestConfig) {
@@ -45,6 +45,8 @@ public final class KhipuPayment {
             origin = .harness(bundled ?? URL(string: "about:blank")!)
         case .staging:
             origin = .staging
+        case .production:
+            origin = .production
         }
         self.init(origin: origin, telemetry: test.telemetry ?? NoopTelemetrySink(), onHandshakeMs: test.onHandshakeMs)
     }
