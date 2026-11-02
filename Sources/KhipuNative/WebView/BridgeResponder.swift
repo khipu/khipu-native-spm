@@ -355,7 +355,11 @@ final class BridgeResponder {
 
     private func evalDeliver(_ envelopeJSON: String, _ target: JsTarget, _ documentToken: String) {
         jsDeliver(envelopeJSON, target, documentToken) { [weak self] ok, reason in
-            if !ok { self?.emitFailure(envelopeJSON, reason ?? "eval_failed", "error") } // a delivery error is reported, never swallowed
+            // A delivery error is reported, never swallowed. A document the probe did not mark refusing it is a stale
+            // drop, with the severity of an epoch-mismatch drop; anything else is an error.
+            guard !ok else { return }
+            let failure = reason ?? "eval_failed"
+            self?.emitFailure(envelopeJSON, failure, failure == "stale_page" ? "warn" : "error")
         }
     }
 
