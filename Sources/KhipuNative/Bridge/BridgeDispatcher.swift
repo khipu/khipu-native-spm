@@ -193,7 +193,12 @@ final class BridgeDispatcher {
     /// capability's result or an error envelope. Some envelopes are dropped without calling `deliver`, for example
     /// oversized ones, ones from another page session, or duplicates of a request in flight; those are reported
     /// through the `TelemetrySink` instead. After `close()`, every call is ignored.
-    func handle(_ requestJSON: String, deliver: @escaping (String) -> Void) {
+    ///
+    /// The first accepted request pins its page session, unless `mayPinSession` returns false: the host returns false
+    /// while its page load has not committed, when the request may come from the document that load replaces. It is
+    /// read under the state lock as the request is accepted, so a concurrent `resetSession()` cannot fall between the
+    /// check and the pin.
+    func handle(_ requestJSON: String, mayPinSession: () -> Bool = { true }, deliver: @escaping (String) -> Void) {
         // 0. Teardown guard: reject post-close BEFORE any parse/insert/enqueue/early-delivery so a request
         //    arriving after close() leaves no pending entry, no queue.async, and no error-envelope delivery. Swift
         //    has no @Volatile, so read `closed` under a brief lock; the accept path re-checks under the lock to
@@ -337,7 +342,7 @@ final class BridgeDispatcher {
 
         // Accept: pin the session now (only a fully-accepted request pins), register the pending entry, arm
         // the timeout, enqueue.
-        if pinned == nil { currentSessionId = sessionIdValue }
+        if pinned == nil && mayPinSession() { currentSessionId = sessionIdValue }
         let entry = PendingEntry(op: opValue, sessionId: sessionIdValue, deliver: deliver)
         entry.startedAtMs = clock() // WALL — started_ago_ms
         entry.startedAtMonoMs = monotonic() // MONOTONIC — latency_ms
@@ -636,8 +641,9 @@ final class BridgeDispatcher {
         ])
     }
 
+    // Sorted keys: the same response serializes to the same bytes, so the envelope is comparable and loggable.
     private static func toJSON(_ object: [String: Any]) -> String {
-        guard let data = try? JSONSerialization.data(withJSONObject: object),
+        guard let data = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]),
               let string = String(data: data, encoding: .utf8) else {
             return "{\"result\":\"error\"}"
         }

@@ -24,8 +24,6 @@ final class KhipuPaymentInternal {
     private let loadPage: (URL) -> Void
     private let deliverRequest: (String) -> Void
     private let recorder: DiagnosticsRecorder
-    // Named exactly `telemetry`: the telemetry-name gate (`bridge/codegen/src/telemetry-gate.ts`) finds the emit
-    // callsites below by that receiver name.
     private let telemetry: TelemetrySink
     private let origin: PaymentOrigin
     /// The SELECTIVE per-domain cookie clear at terminal/close. Injected so the coordinator stays free of WebKit
@@ -703,7 +701,7 @@ final class KhipuPaymentInternal {
         // (double-return / render-gone / restart) can take `lock` in this exact gap — an interleaving the test
         // schedulers cannot otherwise reproduce. See `onReloadClaimWindowForTest`. Mirrors Kotlin.
         onReloadClaimWindowForTest()
-        guard let operationIdHash = reStampForReload(r, claimedRoundSeq: claimedRoundSeq) else { return }
+        guard let operationIdHash = reStampForReload(r, roundSeq: claimedRoundSeq) else { return }
         // Emit after release. Hashed NATIVE id only — the merchant id is PII.
         telemetry.emit(
             event: TelemetryEvent.unrecoverableResume,
@@ -720,16 +718,17 @@ final class KhipuPaymentInternal {
     /// recovery (`webViewRenderGone` → `lifecycle.render_process_gone`) and `restartRequested`: the events have
     /// disjoint field sets, so the mechanics are factored out instead of emitting from here, and there is NO second
     /// reload path. Mirrors Kotlin.
-    private func reStampForReload(_ r: OperationRecord, claimedRoundSeq: UInt64? = nil) -> String? {
+    private func reStampForReload(_ r: OperationRecord, roundSeq: UInt64) -> String? {
         lock.lock(); defer { lock.unlock() }
         if r.terminal != nil { return nil } // a racing terminal absorbed the payment (latch discipline)
-        // Claim-then-recheck. A CLAIMED `_ping` reload (controlledReload passes the claimed seq) must ABORT if a
+        // Re-check the round. A CLAIMED `_ping` reload (controlledReload passes the claimed seq) must ABORT if a
         // bumper (double-return foreground / render-gone / restart / close) superseded the round between
         // claimRound's `lock`-release and HERE — the claim-site seq guard does NOT cover this re-acquire gap. Without
         // it a stale claimed deadline re-stamps OVER the bumper's re-stamp, queues a SECOND reload and emits a
-        // forensically-false `lifecycle.unrecoverable_resume`. The render-gone/restart bumpers pass nil (they bumped
-        // the seq themselves — nothing to re-check). Mirrors Kotlin.
-        if let claimed = claimedRoundSeq, claimed != pingRoundSeq { return nil }
+        // forensically-false `lifecycle.unrecoverable_resume`. The render-gone/restart bumpers pass the seq they
+        // bumped to: a newer bumper in their own bump→re-stamp gap owns the page, and a second re-stamp over it would
+        // queue a second reload. Mirrors Kotlin.
+        if roundSeq != pingRoundSeq { return nil }
         byCorrelation.removeValue(forKey: r.correlationId) // the old page's response is now an orphan (pinned by test)
         r.correlationId = correlationId()
         r.sessionId = sessionId()
@@ -782,6 +781,7 @@ final class KhipuPaymentInternal {
         pingProbeItem?.cancel()
         pingDeadlineItem?.cancel()
         pingRoundSeq += 1
+        let bumpedSeq = pingRoundSeq
         let active: OperationRecord?
         if let id = activeOpId, let r = records[id], r.terminal == nil { active = r } else { active = nil }
         lock.unlock()
@@ -807,9 +807,11 @@ final class KhipuPaymentInternal {
             return
         }
         // Live again — re-stamp + reload (NO second reload path). A nil re-stamp means a racing terminal absorbed
-        // the payment between the active-check and the re-stamp: the latch already owns the outcome — do NOT fail
-        // closed; recovered=false (no reload was performed). Hashed NATIVE id only.
-        let operationIdHash = reStampForReload(r)
+        // the payment, or a newer bumper (restart / another render-gone / a foreground round) took the page after
+        // this bump and owns its reload: do NOT fail closed; recovered=false (no reload was performed here). Hashed
+        // NATIVE id only.
+        onReloadClaimWindowForTest()
+        let operationIdHash = reStampForReload(r, roundSeq: bumpedSeq)
         emitRenderProcessGone(operationIdHash: Sha256.hex(r.nativeOpId), didCrash: didCrash, recovered: operationIdHash != nil)
         if operationIdHash != nil { performReloadOnMain(r) }
     }
@@ -832,8 +834,9 @@ final class KhipuPaymentInternal {
         url.scheme?.lowercased() == "about"
     }
 
-    /// The host detected an unloadable REAL page origin (a main-frame `didFailProvisionalNavigation`/`didFail` —
-    /// host unreachable / file unreadable). Fail the ACTIVE payment FAST with a typed `KhipuPaymentError` through
+    /// The host detected an unloadable REAL page origin (a genuine main-frame `didFailProvisionalNavigation`/`didFail`
+    /// of the page's load — host unreachable / file unreadable — or a page load another document replaced twice; see
+    /// `KhipuWebViewHost.onLoadFailed`). Fail the ACTIVE payment FAST with a typed `KhipuPaymentError` through
     /// the ONE `finish()` instead of a blank sheet for the full `paymentTimeoutMs` budget followed by a misleading
     /// `PAYMENT_TIMEOUT`. The public code follows the origin; see `loadFailed`. Idempotent via the terminal latch (a
     /// load failure racing a real terminal loses cleanly); no active non-terminal payment → safe no-op. The
@@ -955,6 +958,7 @@ final class KhipuPaymentInternal {
     /// action is not a degradation. Mirrors Kotlin.
     func restartRequested() {
         lock.lock()
+        var bumpedSeq: UInt64 = 0
         let active: OperationRecord?
         if let id = activeOpId, let r = records[id], r.terminal == nil { active = r } else { active = nil }
         // Supersede the _ping round under the same lock as the active lookup, and ONLY when there is an active
@@ -963,12 +967,14 @@ final class KhipuPaymentInternal {
             pingProbeItem?.cancel()
             pingDeadlineItem?.cancel()
             pingRoundSeq += 1
+            bumpedSeq = pingRoundSeq
         }
         lock.unlock()
         guard let r = active else { return } // no active non-terminal payment: safe no-op
-        // A nil re-stamp = a racing terminal absorbed the payment (the latch owns the outcome): no reload to
-        // perform, no-op.
-        guard reStampForReload(r) != nil else { return }
+        // A nil re-stamp = a racing terminal absorbed the payment (the latch owns the outcome), or a newer bumper
+        // took the page after this bump and owns its reload: no reload to perform, no-op.
+        onReloadClaimWindowForTest()
+        guard reStampForReload(r, roundSeq: bumpedSeq) != nil else { return }
         // Re-arm the schema timer: cancel the old budget, arm a fresh one (the start() arm pattern, including the
         // post-arm race close) — the deliberate divergence from "one budget per start()". The cancel + handle-swap
         // run UNDER `lock` (as in the Kotlin twin) so concurrent restarts cannot orphan a live timer that fires
@@ -1196,7 +1202,8 @@ final class KhipuPaymentInternal {
             "correlation_id": cid,
             "payload": payload,
         ]
-        guard let data = try? JSONSerialization.data(withJSONObject: envelope),
+        // Sorted keys: the same request serializes to the same bytes.
+        guard let data = try? JSONSerialization.data(withJSONObject: envelope, options: [.sortedKeys]),
               let json = String(data: data, encoding: .utf8) else { return "{}" }
         return json
     }
@@ -1229,8 +1236,9 @@ final class KhipuPaymentInternal {
 
     // --- test seams (@testable visibility; mirror the dispatcher's pendingSize/purgeNow pattern) ---
     // The claim→re-stamp WINDOW seam — NOT a production environment input, so it lives here with the test seams,
-    // not in the init. Fired by `controlledReload` AFTER claimRound won + released `lock` and BEFORE
-    // `reStampForReload` re-acquires it. Production leaves the no-op default; a test injects a supersession bumper
+    // not in the init. Fired by `controlledReload` AFTER claimRound won + released `lock`, and by the bumpers
+    // (`webViewRenderGone`, `restartRequested`) AFTER their seq bump, in each case BEFORE `reStampForReload`
+    // re-acquires `lock`. Production leaves the no-op default; a test injects a supersession bumper
     // here to reproduce the cross-thread interleaving the test schedulers collapse. Mirrors Kotlin's
     // onReloadClaimWindowForTest. Visibility (the Swift counterpart of Kotlin's `@Volatile`): the test assigns this
     // closure BEFORE `appReturnedToForeground` enqueues the probe, which in turn enqueues the deadline on

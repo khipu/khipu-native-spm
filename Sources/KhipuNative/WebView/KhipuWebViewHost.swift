@@ -23,10 +23,10 @@ final class KhipuWebViewHost: NSObject, WKScriptMessageHandler, WKNavigationDele
     // Same inbound bound as the dispatcher and the coordinator (256KB, exact UTF-8 bytes), applied BEFORE the
     // router parses.
     private static let maxRoutedEnvelopeBytes = 256 * 1024
-    // True once the page finished its initial main-frame load (`didFinish`). Gates the post-commit `didFail` so a
-    // main-frame failure AFTER a successful load (a kws.js SPA navigation) does not resolve a load-failure terminal
-    // over a running payment; twin of Android's `onReceivedError` gate. Reset on each `load(url:)`. Main-thread only
-    // (the WKNavigationDelegate callbacks and load() run on main).
+    // True once the page finished its initial main-frame load (`didFinish`, when the tracker says the page-finish is
+    // the page's). Gates `reportLoadFailure` so a main-frame failure AFTER a successful load (a kws.js SPA navigation)
+    // does not resolve a load-failure terminal over a running payment; twin of Android's `onReceivedError` gate. Reset
+    // on each `load(url:)`. Main-thread only (the WKNavigationDelegate callbacks and load() run on main).
     private var hasFinishedInitialLoad = false
 
     /// The verified bundle JS waiting to be injected, when it arrived BEFORE `didFinish`. The two asynchronies (page
@@ -40,9 +40,19 @@ final class KhipuWebViewHost: NSObject, WKScriptMessageHandler, WKNavigationDele
     private var expectedBundleURL: URL?
 
     /// Tests only. When set, `load(url:)` calls it once the block rule is installed, in place of the network page
-    /// load and bundle fetch, with the page URL and that load's epoch, so a test can serve a page from memory under
-    /// the real https origin and hand over its bundle through `acceptVerifiedBundle`. The SDK never sets it.
-    var loadWithoutNetworkForTesting: ((_ url: URL, _ epoch: Int) -> Void)?
+    /// load and bundle fetch, with the page URL and that load's epoch, and takes the navigation it returns as the
+    /// page's. A test serves a page from memory under the real https origin and hands over its bundle through
+    /// `acceptVerifiedBundle`. The SDK never sets it.
+    var loadWithoutNetworkForTesting: ((_ url: URL, _ epoch: Int) -> WKNavigation?)?
+
+    /// Tests only. When set, the host hands it the issue of the page's load with that load's epoch, instead of
+    /// issuing it at once; the page is issued when the test calls `issue`. The SDK never sets it.
+    var holdPageLoadForTesting: ((_ epoch: Int, _ issue: @escaping () -> Void) -> Void)?
+
+    // Which navigation callbacks belong to the host's own page load (see `HostLoadTracker`). Main-thread only.
+    private let hostLoadTracker = HostLoadTracker()
+    // The page and epoch of the current host load, kept to issue the page again when another document took its place.
+    private var hostLoad: (url: URL, epoch: Int)?
 
     /// The steady delay between readiness probes, and the cap of the short first ones (`probeRampMs`). The responder
     /// grants `BridgeResponder.defaultMaxProbeAttempts` of them, about 5 s for the bundle to mount. Tests shorten it
@@ -92,8 +102,9 @@ final class KhipuWebViewHost: NSObject, WKScriptMessageHandler, WKNavigationDele
     /// (Android's twin must return true to survive). Mirrors Kotlin's `onRenderProcessGone`.
     var onRenderProcessGone: ((Bool) -> Void)?
 
-    /// Signalled when a MAIN-FRAME navigation GENUINELY fails (host unreachable, file unreadable), so the coordinator
-    /// fails the payment fast (`webViewLoadFailed`: NETWORK_UNAVAILABLE for an https origin, INVALID_CONFIGURATION for
+    /// Signalled when the page's load cannot produce the page: a MAIN-FRAME navigation of that load, or of its
+    /// document before its first page-finish, GENUINELY fails (host unreachable, file unreadable), or another document
+    /// took the place of the page's load twice. The coordinator then fails the payment fast (`webViewLoadFailed`: NETWORK_UNAVAILABLE for an https origin, INVALID_CONFIGURATION for
     /// the harness) instead of a blank sheet for the whole payment budget and then a misleading PAYMENT_TIMEOUT.
     /// Settable after construction, like `onResponseEnvelope`; `KhipuPayment` wires it weakly. Detection differs from
     /// Android: a missing bundled harness resolves to about:blank, which loads SUCCESSFULLY and never reaches here, so
@@ -226,7 +237,9 @@ final class KhipuWebViewHost: NSObject, WKScriptMessageHandler, WKNavigationDele
     func load(url: URL) {
         // Derived from the URL HERE, so no caller can load a page that skips verification (ADR-221).
         responder.beginLoad(requireVerifiedBundle: Self.requiresVerifiedBundle(url))
+        hostLoadTracker.load()
         let epoch = responder.generation() // the page the bundle fetch below belongs to
+        hostLoad = (url, epoch)
         dispatcher.resetSession() // new page load => new session binding; resolves abandoned requests
         hasFinishedInitialLoad = false // a fresh page is back in the initial-load phase
         verifiedBundleJS = nil // a new page epoch invalidates any bundle verified for the previous one
@@ -240,13 +253,16 @@ final class KhipuWebViewHost: NSObject, WKScriptMessageHandler, WKNavigationDele
         let isHttps = url.scheme?.lowercased() == "https"
         expectedBundleURL = isHttps ? Self.bundleURL(forPage: url) : nil
         guard isHttps, let bundleURL = expectedBundleURL else {
-            webView.load(URLRequest(url: url))
+            issuePageLoad(url, epoch: epoch)
             return
         }
         // The block rule must be installed BEFORE the page can request the bundle, or WebKit loads and executes it
         // unverified. So the load is CHAINED to the install completion, never parallel.
         installBundleBlockRule(attemptsLeft: Self.blockRuleAttempts) { [weak self] installed in
             guard let self = self else { return }
+            // A newer load began while this rule was installing: this load issues, fetches and signals nothing, since a
+            // failure it signalled would end the newer load's payment.
+            guard epoch == self.responder.generation() else { return }
             guard installed else {
                 // FAIL-CLOSED: without the rule the page would execute an unverified bundle, which is exactly what
                 // ADR-003 forbids. Refusing to load costs a payment in a rare transient case; loading anyway would
@@ -259,13 +275,26 @@ final class KhipuWebViewHost: NSObject, WKScriptMessageHandler, WKNavigationDele
                 self.onBundleVerificationFailed?()
                 return
             }
-            if let loadWithoutNetwork = self.loadWithoutNetworkForTesting {
-                loadWithoutNetwork(url, epoch)
-                return
-            }
-            self.webView.load(URLRequest(url: url))
-            self.fetchVerifyAndInjectBundle(from: bundleURL, epoch: epoch)
+            self.issuePageLoad(url, epoch: epoch)
+            if self.loadWithoutNetworkForTesting == nil { self.fetchVerifyAndInjectBundle(from: bundleURL, epoch: epoch) }
         }
+    }
+
+    /// Issue the page's load, or hand it to `holdPageLoadForTesting`, and tell the tracker its navigation. A load whose
+    /// epoch is no longer current (a newer `load(url:)` began meanwhile) issues nothing.
+    private func issuePageLoad(_ url: URL, epoch: Int) {
+        let issue = { [weak self] in
+            guard let self = self else { return }
+            guard epoch == self.responder.generation() else { return }
+            let navigation: WKNavigation?
+            if let loadWithoutNetwork = self.loadWithoutNetworkForTesting {
+                navigation = loadWithoutNetwork(url, epoch)
+            } else {
+                navigation = self.webView.load(URLRequest(url: url))
+            }
+            self.hostLoadTracker.issued(navigation)
+        }
+        if let hold = holdPageLoadForTesting { hold(epoch, issue) } else { issue() }
     }
 
     /// The bundle URL for a payment page: same origin, `/v1/kws.js` (the path the interceptor and the block rule both
@@ -485,7 +514,9 @@ final class KhipuWebViewHost: NSObject, WKScriptMessageHandler, WKNavigationDele
         // the delivery evaporate with no diagnostic, while Android's strong capture reaches the `alive` gate and
         // emits it. The responder's own deliver closure holds the WebView weakly, so this retains no WebView.
         let responder = self.responder
-        dispatcher.handle(json) { responseJSON in
+        // Until the host load commits, the message may come from the document that load replaces, so it must not pin
+        // the bridge session.
+        dispatcher.handle(json, mayPinSession: { !responder.isAwaitingHostLoadCommit() }) { responseJSON in
             responder.respond(responseJSON, generation: generation)
         }
     }
@@ -525,23 +556,33 @@ final class KhipuWebViewHost: NSObject, WKScriptMessageHandler, WKNavigationDele
     }
 
     func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
-        // Self-navigation defense: a main-frame navigation the PAGE initiates (server redirect, JS location change)
-        // never goes through load(), so the responder resets the epoch and readiness at commit time; otherwise a
-        // previous page's response could be evaluated into the new document. Commit, not
-        // didStartProvisionalNavigation, so a CANCELLED provisional navigation (e.g. a bank-app universal link) never
-        // invalidates the live page's epoch. The responder recognizes the commit of a host-initiated load() and does
-        // NOT re-bump for it: an unconditional bump here would abandon the startPayment_v1 request queued between
-        // load() and this callback.
-        responder.onNavigationCommitted()
+        switch hostLoadTracker.committed(navigation) {
+        case .page:
+            responder.onHostLoadCommitted()
+        case .other:
+            // While the host load is pending this is a document the load will replace, and the responder keeps the
+            // epoch; after the page committed it is a self-navigation (server redirect, JS location change), and the
+            // epoch moves on. Commit, not didStartProvisionalNavigation, so a CANCELLED provisional navigation (e.g. a
+            // bank-app universal link) never invalidates the live page's epoch.
+            responder.onNavigationCommitted()
+        case .otherReissue:
+            // Another document committed after the page's load was issued, and may have cancelled it without a
+            // callback: the page is issued again.
+            responder.onNavigationCommitted()
+            if let load = hostLoad { issuePageLoad(load.url, epoch: load.epoch) }
+        case .otherFailLoad:
+            responder.onNavigationCommitted()
+            onLoadFailed?()
+        }
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-        // A page-finish that arrives after `load(url:)` began a new epoch, but before that load committed, is the
-        // previous document's. Probing it under the new epoch would test the old page's khipuBridge and its record of
-        // the bundle request, and injecting would hand it the new load's bundle.
-        guard !responder.isAwaitingHostLoadCommit() else { return }
-        // The initial main-frame load completed: a LATER didFail is a kws.js SPA navigation, NOT an unloadable
-        // origin, so it must not fail the running payment (gated in didFail below).
+        // A page-finish before the page's own load committed belongs to the previous document or to one that load will
+        // replace. Probing it under the new epoch would test that page's khipuBridge and its record of the bundle
+        // request, and injecting would hand it the new load's bundle.
+        guard hostLoadTracker.finished() == .probe, !responder.isAwaitingHostLoadCommit() else { return }
+        // The initial main-frame load completed: a LATER main-frame failure is a kws.js SPA navigation, NOT an
+        // unloadable origin, so it must not fail the running payment (gated in reportLoadFailure below).
         hasFinishedInitialLoad = true
         // The other side of the race: the verified bundle arrived before the page finished, so inject it now. Cleared
         // after injecting so a later navigation cannot re-inject a bundle verified for the old page.
@@ -563,31 +604,33 @@ final class KhipuWebViewHost: NSObject, WKScriptMessageHandler, WKNavigationDele
         onRenderProcessGone?(true) // iOS carries no didCrash detail — always true
     }
 
-    /// WebKit callback: a main-frame load failed before it was committed. Unless the load was merely cancelled, the
-    /// payment in progress fails right away instead of waiting for its timeout.
+    /// WebKit callback: a main-frame load failed before it was committed. If it is the page's load, or a navigation
+    /// of the page's document before that document finished loading, and the load was not merely cancelled, the
+    /// payment fails right away instead of waiting for its timeout.
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
-        reportLoadFailure(error)
+        reportLoadFailure(navigation, error)
     }
 
-    /// WebKit callback: a committed load failed. Handled like a provisional failure only until the page first
-    /// finishes loading; after that, a failure belongs to the page's own navigation and does not affect the payment.
+    /// WebKit callback: a committed load failed. Handled like a provisional failure.
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
-        guard !hasFinishedInitialLoad else { return }
-        reportLoadFailure(error)
+        reportLoadFailure(navigation, error)
     }
 
-    /// Route a navigation failure to the fail-fast seam, but IGNORE benign cancellations: a cancelled navigation is
-    /// how a bank-app universal link or a load superseded by the next one surfaces, NOT an unloadable origin, and
-    /// firing the seam there would kill a live payment. The pure `isGenuineLoadFailure` is unit-tested; this wiring
-    /// is not.
+    /// Route a navigation failure to the fail-fast seam. Two filters keep a running payment alive:
+    /// - a benign cancellation (`NSURLErrorCancelled`: a bank-app universal link, or a load superseded by the next
+    ///   one) is not an unloadable origin;
+    /// - a failure counts only for the host's own page load, or for that page's document before its first
+    ///   page-finish (`HostLoadTracker.failed`); later it belongs to a kws.js SPA navigation.
     ///
-    /// iOS keys benign on `NSURLErrorCancelled` and splits provisional (`didFailProvisionalNavigation`,
-    /// unconditional) vs committed (`didFail`, phase-gated above) failures across two callbacks; Android applies both
-    /// filters, the benign cancel (`isGenuineLoadFailure(errorCode)`) and the initial-load gate, in its single
-    /// `onReceivedError`. On both, a benign cancel OR a post-initial-load main-frame failure never becomes a payment
-    /// terminal.
-    private func reportLoadFailure(_ error: Error) {
-        if Self.isGenuineLoadFailure(error) { onLoadFailed?() }
+    /// Android applies the same two filters in `onReceivedError`. The classifier and the tracker are unit-tested;
+    /// this wiring is structural.
+    private func reportLoadFailure(_ navigation: WKNavigation?, _ error: Error) {
+        guard Self.isGenuineLoadFailure(error) else { return }
+        switch hostLoadTracker.failed(navigation) {
+        case .hostLoad: onLoadFailed?()
+        case .page: if !hasFinishedInitialLoad { onLoadFailed?() }
+        case .ignore: break
+        }
     }
 
     /// Pure classifier (static so unit tests can drive it without a WKWebView, like `isResponseEnvelope` /

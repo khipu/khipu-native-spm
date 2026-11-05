@@ -47,7 +47,6 @@ enum ReadinessOutcome: Equatable {
 /// coordinator's `gate_blocked_bundle` terminal already records the failure.
 final class BridgeResponder {
     private let jsDeliver: JsDelivery
-    // Named `telemetry` on purpose: the telemetry-name gate finds emit callsites by the literal `telemetry.emit(`.
     private let telemetry: TelemetrySink
     private let maxQueued: Int
 
@@ -60,7 +59,7 @@ final class BridgeResponder {
     private var pageGeneration = 0
     private var probeMisses = 0 // bounded readiness re-poll budget for the current epoch
     private var probeExhausted = false // re-poll budget spent without khipuBridge appearing: fail-closed with diagnostics
-    private var hostLoadPending = false // a host-initiated load() bumped the epoch; its own commit must NOT re-bump
+    private var hostLoadPending = false // a host-initiated load() bumped the epoch and its own commit has not been reported yet
     // The token generator, injected so tests are deterministic, and the current epoch's document token, rotated with
     // the epoch and read and written only under `lock`.
     private let newDocumentToken: () -> String
@@ -108,25 +107,28 @@ final class BridgeResponder {
 
     /// New page epoch for a HOST-initiated load: bump the epoch, drop readiness, reset the probe budget, abandon any
     /// queued responses from the previous page WITH a per-item `stale_page` diagnostic (the same dropped delivery as
-    /// a respond-time stale drop, so the same observability). The load's own commit callback must then route through
-    /// `onNavigationCommitted()`, which recognizes it and does NOT re-bump: deliveries queued between `load()` and
-    /// the commit (the `startPayment_v1` request) belong to THIS page and must survive to readiness. A second,
-    /// unconditional bump at commit would abandon the payment request. Mirrors Kotlin.
+    /// a respond-time stale drop, so the same observability). The host reports that load's own commit through
+    /// `onHostLoadCommitted()`; any other commit before it goes through `onNavigationCommitted()`, which keeps the
+    /// epoch, so the deliveries queued between `load()` and the commit (the `startPayment_v1` request) survive to
+    /// readiness. Mirrors Kotlin.
     func beginLoad(requireVerifiedBundle: Bool = false) {
         bumpEpoch(markHostLoad: true, requireVerifiedBundle: requireVerifiedBundle)
     }
 
-    /// A main-frame navigation COMMITTED (`didCommit` / `onPageStarted`). The first commit after a host-initiated
-    /// `beginLoad()` is that load's own navigation: the epoch was already bumped synchronously, so this is a no-op.
-    /// Any other commit is a PAGE self-navigation (server redirect, JS location change) that never went through
-    /// `load()`: full epoch bump (defense in depth: a previous page's response must never reach the new one).
-    /// Mirrors Kotlin.
+    /// The host load's own navigation committed, as the host identified it (`HostLoadTracker`): the epoch was already
+    /// bumped by `beginLoad()`, so only the pending flag clears. Mirrors Kotlin.
+    func onHostLoadCommitted() { lock.lock(); hostLoadPending = false; lock.unlock() }
+
+    /// A main-frame navigation that is not the host load's committed (`didCommit` / `onPageStarted`). While a host
+    /// load is pending, that document is one the load will replace, so the epoch stays: a bump would abandon the
+    /// `startPayment_v1` request queued for the load. Otherwise it is a PAGE self-navigation (server redirect, JS
+    /// location change) that never went through `load()`: full epoch bump (defense in depth: a previous page's
+    /// response must never reach the new one). Mirrors Kotlin.
     func onNavigationCommitted() {
         lock.lock()
-        let isHostLoadCommit = hostLoadPending
-        hostLoadPending = false
+        let pending = hostLoadPending
         lock.unlock()
-        if !isHostLoadCommit { bumpEpoch(markHostLoad: false, requireVerifiedBundle: nil) } // requirement carries over
+        if !pending { bumpEpoch(markHostLoad: false, requireVerifiedBundle: nil) } // requirement carries over
     }
 
     private func bumpEpoch(markHostLoad: Bool, requireVerifiedBundle: Bool?) {
